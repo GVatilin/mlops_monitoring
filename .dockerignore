@@ -1,0 +1,6 @@
+.git
+.env
+*.csv
+__pycache__
+.ruff_cache
+dq_reports

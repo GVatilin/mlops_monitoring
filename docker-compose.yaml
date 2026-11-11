@@ -1,0 +1,294 @@
+name: mlops_monitoring
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    networks:
+      - ml-scorer
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      - zookeeper
+    networks:
+      - ml-scorer
+    ports:
+      - "9095:9095"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9095
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9095", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - ml-scorer
+    restart: on-failure
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: |
+      "
+      echo 'Ожидание готовности Kafka...'
+      while ! kafka-topics --bootstrap-server kafka:9092 --list; do
+        sleep 1
+      done
+
+      echo 'Создание топиков...'
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scoring --partitions 3 --replication-factor 1 --config retention.ms=604800000
+
+      echo 'Топики успешно созданы:'
+      kafka-topics --bootstrap-server kafka:9092 --list
+      "
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      - kafka
+    networks:
+      - ml-scorer
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+  fraud_detector:
+    build: ./fraud_detector
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_TRANSACTIONS_TOPIC: "transactions"
+      KAFKA_SCORING_TOPIC: "scoring"
+      MODELS_DIR: "/models"
+    volumes:
+      - model_registry:/models
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+
+  postgres:
+    image: postgres:15
+    networks:
+      - ml-scorer
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/grafana.sql:/docker-entrypoint-initdb.d/grafana.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+
+  transaction_simulator:
+    build: ./transaction_simulator
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "transactions"
+      TRANSACTIONS_CSV_PATH: /data/train.csv
+      SEND_INTERVAL_SECONDS: "0.1"
+    volumes:
+      - ${TRAIN_DATA_CSV}:/data/train.csv:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  scoring_writer:
+    build: ./scoring_writer
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/metrics')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - ml-scorer
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_SCORING_TOPIC: ${KAFKA_SCORING_TOPIC}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+
+  data_loader:
+    build: ./data_loader
+    networks:
+      - ml-scorer
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      LABELED_CSV_PATH: /data/train.csv
+      TRAINING_DATA_DIR: /training_data
+    volumes:
+      - ${TRAIN_DATA_CSV}:/data/train.csv:ro
+      - training_data:/training_data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  airflow:
+    build: ./airflow
+    user: "0:0"
+    networks:
+      - ml-scorer
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow_state/airflow.db
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+      PYTHONPATH: /opt/airflow
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TRAINING_DATA_DIR: /opt/airflow/training_data
+      MODELS_DIR: /opt/airflow/models
+      FRAUD_SRC: /opt/airflow/fraud_src
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./pipeline:/opt/airflow/pipeline:ro
+      - ./fraud_detector/src:/opt/airflow/fraud_src:ro
+      - training_data:/opt/airflow/training_data
+      - model_registry:/opt/airflow/models
+      - ./dq_reports:/opt/airflow/dq_reports
+      - airflow_state:/opt/airflow/airflow_state
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      data_loader:
+        condition: service_completed_successfully
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    networks:
+      - ml-scorer
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    networks:
+      - ml-scorer
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_DATE_FORMATS_DEFAULT_TIMEZONE: UTC
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      scoring_writer:
+        condition: service_healthy
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.0
+    networks:
+      - ml-scorer
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($$|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
+networks:
+  ml-scorer:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  training_data:
+  model_registry:
+  airflow_state:
+  prometheus_data:
+  grafana_data:
